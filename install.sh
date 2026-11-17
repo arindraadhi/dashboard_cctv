@@ -12,7 +12,7 @@ echo "=============================================="
 echo "[1/5] Install paket (ffmpeg, python, flask, numpy, pillow)..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y ffmpeg python3 python3-flask python3-numpy python3-pil ca-certificates curl
+apt-get install -y ffmpeg python3 python3-venv python3-pip python3-flask python3-numpy python3-pil ca-certificates curl
 apt-get install -y python3-waitress || echo "waitress tidak tersedia, pakai server bawaan Flask"
 
 echo "[2/5] Atur zona waktu & NTP..."
@@ -83,6 +83,70 @@ except Exception:
     pass
 
 
+COCO = {'person': (0, 'Orang'), 'bicycle': (1, 'Sepeda'), 'car': (2, 'Mobil'), 'motorcycle': (3, 'Motor')}
+DEF_OBJS = ['person', 'motorcycle']
+MODEL = os.path.join(BASE, 'models', 'yolov8n.onnx')
+
+
+def iou(a, b):
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    i = ix * iy
+    return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i + 1e-6)
+
+
+class Detector:
+    def __init__(s):
+        s.ok, s.err, s.lock = False, '', threading.Lock()
+        try:
+            import onnxruntime as ort
+            so = ort.SessionOptions()
+            so.intra_op_num_threads = 3
+            s.sess = ort.InferenceSession(MODEL, so, providers=['CPUExecutionProvider'])
+            i = s.sess.get_inputs()[0]
+            s.name = i.name
+            s.S = i.shape[2] if isinstance(i.shape[2], int) else 416
+            s.ok = True
+            log('AI siap, ukuran input', s.S)
+        except Exception as e:
+            s.err = str(e)
+            log('AI TIDAK AKTIF:', e)
+
+    def detect(s, fr, objs, conf):
+        ids = np.array([COCO[o][0] for o in objs])
+        r = min(s.S / W, s.S / H)
+        nw, nh = int(W * r), int(H * r)
+        im = Image.fromarray(fr)
+        if (nw, nh) != (W, H):
+            im = im.resize((nw, nh))
+        px, py = (s.S - nw) // 2, (s.S - nh) // 2
+        cv = np.full((s.S, s.S, 3), 114, np.uint8)
+        cv[py:py + nh, px:px + nw] = np.asarray(im)
+        x = (cv.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+        with s.lock:
+            out = s.sess.run(None, {s.name: x})[0][0]
+        if out.shape[0] < out.shape[1]:
+            out = out.T
+        sc = out[:, 4 + ids]
+        cf = sc.max(1)
+        k = cf >= conf
+        if not k.any():
+            return []
+        b, cf, cl = out[k, :4], cf[k], ids[sc[k].argmax(1)]
+        xy = np.stack([b[:, 0] - b[:, 2] / 2, b[:, 1] - b[:, 3] / 2, b[:, 0] + b[:, 2] / 2, b[:, 1] + b[:, 3] / 2], 1)
+        xy = (xy - np.array([px, py, px, py])) / r
+        res = []
+        for i in cf.argsort()[::-1]:
+            bx = tuple(int(v) for v in xy[i])
+            if all(iou(bx, q[2]) < 0.5 for q in res):
+                name = next(v[1] for v in COCO.values() if v[0] == cl[i])
+                res.append((name, float(cf[i]), bx))
+        return res
+
+
+AI = Detector()
+
+
 def tg(method, fields=None, files=None, timeout=30):
     token = cfg.get('token')
     if not token:
@@ -116,8 +180,8 @@ def today0():
     return datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def add_event(cam, snap, pct):
-    e = {'t': int(time.time()), 'cam': cam.id, 'name': cam.c['name'], 'snap': snap, 'pct': round(pct, 1)}
+def add_event(cam, snap, pct, what='Gerakan'):
+    e = {'t': int(time.time()), 'cam': cam.id, 'name': cam.c['name'], 'snap': snap, 'pct': round(pct, 1), 'what': what}
     with lock:
         events.append(e)
         with open(EVT_FILE, 'a') as f:
@@ -135,8 +199,8 @@ def prune(keep=300):
 
 def notify(cam, jpg, e):
     cid = cfg['chat_id']
-    cap = (f"🚨 Gerakan terdeteksi\n📷 {cam.c['name']}\n"
-           f"🕒 {time.strftime('%d/%m/%Y %H:%M:%S')}\n📊 Area gerak: {e['pct']}%")
+    cap = (f"🚨 {e.get('what', 'Gerakan')} terdeteksi\n📷 {cam.c['name']}\n"
+           f"🕒 {time.strftime('%d/%m/%Y %H:%M:%S')}")
     if cam.c.get('photo', True):
         tg('sendPhoto', {'chat_id': cid, 'caption': cap}, {'photo': ('motion.jpg', jpg, 'image/jpeg')})
     else:
@@ -161,6 +225,7 @@ class Cam(threading.Thread):
         s.c, s.id = c, c['id']
         s.stop, s.proc, s.jpg = False, None, None
         s.last, s.online, s.last_motion, s.level, s.cool = 0, False, 0, 0.0, 0
+        s.busy, s.nextchk = False, 0
 
     def url(s):
         c, q = s.c, urllib.parse.quote
@@ -209,11 +274,18 @@ class Cam(threading.Thread):
                 if warm < 5:
                     continue
                 hits = hits + 1 if s.level >= s.c.get('area', 0.8) else 0
-                if hits >= 2 and cfg.get('armed') and t - s.cool > s.c.get('cooldown', 30):
-                    s.cool = s.last_motion = t
+                if (hits >= 2 and cfg.get('armed') and not s.busy and t > s.nextchk
+                        and t - s.cool > s.c.get('cooldown', 30)):
                     hits = 0
                     ys, xs = np.where(d)
-                    s.trigger(im, (int(xs.min()) * 4, int(ys.min()) * 4, int(xs.max()) * 4 + 4, int(ys.max()) * 4 + 4))
+                    box = (int(xs.min()) * 4, int(ys.min()) * 4, int(xs.max()) * 4 + 4, int(ys.max()) * 4 + 4)
+                    objs = s.c.get('objs', DEF_OBJS)
+                    if objs and AI.ok:
+                        s.busy = True
+                        threading.Thread(target=s.verify, args=(im, box, objs), daemon=True).start()
+                    else:
+                        s.cool = s.last_motion = t
+                        s.trigger(im, [('Gerakan', 0, box)], 'Gerakan')
             s.online = False
             try:
                 s.proc.kill()
@@ -222,10 +294,29 @@ class Cam(threading.Thread):
             if not s.stop:
                 time.sleep(5)
 
-    def trigger(s, im, box):
+    def verify(s, im, box, objs):
+        try:
+            dets = AI.detect(np.asarray(im), objs, s.c.get('conf', 45) / 100)
+        except Exception as e:
+            log('AI error, kirim sebagai gerakan biasa:', e)
+            dets = [('Gerakan', 0, box)]
+        try:
+            if dets:
+                s.cool = s.last_motion = time.time()
+                s.trigger(im, dets, ', '.join(sorted({d[0] for d in dets})))
+            else:
+                s.nextchk = time.time() + 3
+                log('Gerakan diabaikan (bukan orang/motor):', s.c['name'])
+        finally:
+            s.busy = False
+
+    def trigger(s, im, dets, what):
         im = im.copy()
         dr = ImageDraw.Draw(im)
-        dr.rectangle(box, outline=(255, 59, 92), width=3)
+        for nm, cf, bx in dets:
+            dr.rectangle(bx, outline=(255, 59, 92), width=3)
+            if cf:
+                dr.text((bx[0] + 4, max(0, bx[1] - 12)), f'{nm} {int(cf * 100)}%', fill=(255, 255, 0))
         dr.text((8, 6), f"{s.c['name']}  {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(255, 255, 255))
         b = io.BytesIO()
         im.save(b, 'JPEG', quality=85)
@@ -233,9 +324,9 @@ class Cam(threading.Thread):
         name = f"{int(time.time())}_{s.id}.jpg"
         with open(os.path.join(SNAP, name), 'wb') as f:
             f.write(jpg)
-        e = add_event(s, name, s.level)
+        e = add_event(s, name, s.level, what)
         prune()
-        log('GERAKAN', s.c['name'], s.level)
+        log('TERDETEKSI', s.c['name'], what)
         if cfg.get('token') and cfg.get('chat_id'):
             threading.Thread(target=notify, args=(s, jpg, e), daemon=True).start()
 
@@ -371,6 +462,8 @@ def live(cid):
 
 def pub(c):
     r = {k: c.get(k) for k in ('id', 'name', 'ip', 'port', 'user', 'sub', 'sens', 'area', 'cooldown', 'photo', 'clip', 'enabled')}
+    r['objs'] = c.get('objs', DEF_OBJS)
+    r['conf'] = c.get('conf', 45)
     cm = cams.get(c['id'])
     r['online'] = bool(cm and cm.online)
     r['level'] = cm.level if cm else 0
@@ -388,7 +481,7 @@ def state():
             hours[datetime.datetime.fromtimestamp(e['t']).hour] += 1
     return jsonify(armed=cfg.get('armed', True), cams=[pub(c) for c in cfg['cameras']], today=today, hours=hours,
                    events=list(events)[::-1][:24], sys=sysinfo(), token_set=bool(cfg.get('token')),
-                   chat_id=cfg.get('chat_id', ''), pw_set=bool(cfg.get('password')))
+                   chat_id=cfg.get('chat_id', ''), pw_set=bool(cfg.get('password')), ai=AI.ok)
 
 
 @app.post('/api/arm')
@@ -431,7 +524,8 @@ def cam_save():
          'user': j.get('user') or 'admin', 'pass': j.get('pass') or (old or {}).get('pass', ''),
          'sub': bool(j.get('sub', True)), 'sens': int(j.get('sens', 50)), 'area': float(j.get('area', 0.8)),
          'cooldown': int(j.get('cooldown', 30)), 'photo': bool(j.get('photo', True)),
-         'clip': bool(j.get('clip', False)), 'enabled': bool(j.get('enabled', True))}
+         'clip': bool(j.get('clip', False)), 'enabled': bool(j.get('enabled', True)),
+         'objs': [o for o in j.get('objs', DEF_OBJS) if o in COCO], 'conf': int(j.get('conf', 45))}
     if old:
         old.update(c)
     else:
@@ -514,7 +608,7 @@ aside{display:flex;flex-direction:column;gap:16px}
 .ev:hover{background:#1a2238;border-color:var(--line)}
 .ev img{width:84px;height:48px;object-fit:cover;border-radius:8px;background:#05070d}
 .ev b{font-size:13px;display:block}
-dialog{background:#111729;color:var(--tx);border:1px solid var(--line);border-radius:20px;padding:22px;width:min(440px,92vw)}
+dialog{max-height:92vh;overflow:auto;background:#111729;color:var(--tx);border:1px solid var(--line);border-radius:20px;padding:22px;width:min(440px,92vw)}
 dialog::backdrop{background:#000a;backdrop-filter:blur(4px)}
 dialog h3{font-size:17px}
 label{display:block;font-size:12px;color:var(--mut);margin:10px 0 4px}
@@ -553,6 +647,9 @@ input[type=range]{width:100%}
  <label>Sensitivitas: <span id="v_sens"></span></label><input type="range" id="f_sens" min="1" max="100" oninput="v_sens.textContent=this.value">
  <div class="row"><div><label>Min. area gerak (%)</label><input type="number" id="f_area" step="0.1" value="0.8"></div><div><label>Jeda notifikasi (detik)</label><input type="number" id="f_cd" value="30"></div></div>
  <div class="chk"><label><input type="checkbox" id="f_photo" checked>Kirim foto</label><label><input type="checkbox" id="f_clip">Kirim klip 8 dtk</label><label><input type="checkbox" id="f_en" checked>Aktif</label></div>
+ <label>Deteksi objek AI (kosongkan semua = kirim semua gerakan)</label>
+ <div class="chk" style="margin-top:4px"><label><input type="checkbox" class="ob" value="person">🧍 Orang</label><label><input type="checkbox" class="ob" value="motorcycle">🏍 Motor</label><label><input type="checkbox" class="ob" value="car">🚗 Mobil</label><label><input type="checkbox" class="ob" value="bicycle">🚲 Sepeda</label></div>
+ <label>Keyakinan AI</label><select id="f_conf"><option value="30">Sensitif (30%)</option><option value="45">Normal (45%)</option><option value="60">Ketat (60%)</option></select>
  <p class="hint">Password = <b>Safety Code</b> di stiker bawah kamera (atau password yang Anda set di Imou Life). Pastikan RTSP/ONVIF aktif bila ada opsinya. Untuk klip video, set kamera ke H.264.</p>
  <div class="fb"><button onclick="dCam.close()">Batal</button><button class="pri" onclick="saveCam()">Simpan</button></div>
 </dialog>
@@ -579,12 +676,12 @@ async function load(){
  $('#armed').checked=S.armed;$('#armtxt').textContent=S.armed?'AKTIF':'NONAKTIF';
  $('#sToday').textContent=S.today;$('#sCam').textContent=S.cams.filter(c=>c.online).length+' / '+S.cams.length;
  $('#sLast').textContent=ago(S.events[0]&&S.events[0].t);
- $('#sSys').textContent=(S.sys.temp!=null?S.sys.temp.toFixed(0)+'°C':'–')+' · RAM '+(S.sys.mem??'–')+'%';
+ $('#sSys').textContent=(S.sys.temp!=null?S.sys.temp.toFixed(0)+'°C':'–')+' · RAM '+(S.sys.mem??'–')+'%'+(S.ai?' · AI ✓':' · AI ✗');
  const ns=JSON.stringify(S.cams.map(c=>[c.id,c.name,c.ip,c.sub]));
  if(ns!==sig){sig=ns;$('#cams').innerHTML=S.cams.length?S.cams.map(card).join(''):'<div class="empty"><div style="font-size:40px">📷</div><p>Belum ada kamera. Tambahkan kamera Imou pertama Anda.</p><button class="pri" onclick="openCam()">+ Tambah kamera</button></div>'}
  S.cams.forEach(c=>{const p=$('#p'+c.id);if(!p)return;p.className='pill '+(c.online?'ok':'off');p.textContent=c.enabled?(c.online?'● ONLINE':'OFFLINE'):'NONAKTIF';$('#l'+c.id).style.width=Math.min(100,c.level*12)+'%'});
  const es=JSON.stringify(S.events.map(e=>e.t));
- if(es!==esig){esig=es;$('#evts').innerHTML=S.events.length?S.events.map(e=>`<a class="ev" href="/snaps/${e.snap}" target="_blank"><img loading="lazy" src="/snaps/${e.snap}"><div><b>${esc(e.name)}</b><small>${hm(e.t)} · ${e.pct}% area</small></div></a>`).join(''):'<p class="mut">Belum ada gerakan terdeteksi.</p>'}
+ if(es!==esig){esig=es;$('#evts').innerHTML=S.events.length?S.events.map(e=>`<a class="ev" href="/snaps/${e.snap}" target="_blank"><img loading="lazy" src="/snaps/${e.snap}"><div><b>${esc(e.name)}</b><small>${hm(e.t)} · ${esc(e.what||'Gerakan')}</small></div></a>`).join(''):'<p class="mut">Belum ada gerakan terdeteksi.</p>'}
  const mx=Math.max(1,...S.hours),h=new Date().getHours();
  $('#chart').innerHTML=S.hours.map((v,i)=>`<div class="bar${i==h?' now':''}" title="${i}:00 — ${v}"><i style="height:${v/mx*100}%"></i><span>${i%6==0?i:''}</span></div>`).join('');
 }
@@ -594,11 +691,13 @@ function openCam(id){
  const c=(S&&S.cams.find(x=>x.id===id))||{};
  $('#f_id').value=c.id||'';$('#f_name').value=c.name||'';$('#f_ip').value=c.ip||'';$('#f_port').value=c.port||554;$('#f_user').value=c.user||'admin';$('#f_pass').value='';
  $('#f_sub').value=c.sub===false?'0':'1';$('#f_sens').value=c.sens||50;$('#v_sens').textContent=c.sens||50;$('#f_area').value=c.area||0.8;$('#f_cd').value=c.cooldown||30;
- $('#f_photo').checked=c.photo!==false;$('#f_clip').checked=!!c.clip;$('#f_en').checked=c.enabled!==false;$('#dCam').showModal();
+ $('#f_photo').checked=c.photo!==false;$('#f_clip').checked=!!c.clip;$('#f_en').checked=c.enabled!==false;
+ const ob=c.objs||['person','motorcycle'];document.querySelectorAll('.ob').forEach(x=>x.checked=ob.includes(x.value));$('#f_conf').value=c.conf||45;
+ $('#dCam').showModal();
 }
 async function saveCam(){
  if(!$('#f_ip').value.trim())return toast('IP kamera wajib diisi');
- await api('/api/camera','POST',{id:$('#f_id').value,name:$('#f_name').value,ip:$('#f_ip').value,port:$('#f_port').value,user:$('#f_user').value,pass:$('#f_pass').value,sub:$('#f_sub').value==='1',sens:$('#f_sens').value,area:$('#f_area').value,cooldown:$('#f_cd').value,photo:$('#f_photo').checked,clip:$('#f_clip').checked,enabled:$('#f_en').checked});
+ await api('/api/camera','POST',{id:$('#f_id').value,name:$('#f_name').value,ip:$('#f_ip').value,port:$('#f_port').value,user:$('#f_user').value,pass:$('#f_pass').value,sub:$('#f_sub').value==='1',sens:$('#f_sens').value,area:$('#f_area').value,cooldown:$('#f_cd').value,photo:$('#f_photo').checked,clip:$('#f_clip').checked,enabled:$('#f_en').checked,objs:[...document.querySelectorAll('.ob:checked')].map(x=>x.value),conf:$('#f_conf').value});
  $('#dCam').close();toast('Kamera disimpan, menyambung…');setTimeout(load,800);
 }
 async function delCam(id){if(confirm('Hapus kamera ini?')){await api('/api/camera/'+id,'DELETE');load()}}
@@ -610,8 +709,57 @@ load();setInterval(load,3000);
 </script></body></html>
 HTMLEOF
 
+echo "[AI] Menyiapkan deteksi objek (orang & motor)..."
+PY=/usr/bin/python3
+mkdir -p "$APP/models"
+ARCH="$(uname -m)"
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "x86_64" ]; then
+  if [ ! -x "$APP/venv/bin/python" ]; then
+    python3 -m venv --system-site-packages "$APP/venv" </dev/null || true
+  fi
+  if [ -x "$APP/venv/bin/python" ] && "$APP/venv/bin/pip" install --no-cache-dir onnxruntime </dev/null; then
+    PY="$APP/venv/bin/python"
+  else
+    echo "!! Gagal memasang onnxruntime. AI nonaktif, semua gerakan akan dikirim."
+  fi
+else
+  echo "!! Arsitektur $ARCH tidak didukung onnxruntime. AI nonaktif, semua gerakan akan dikirim."
+fi
+
+if [ "$PY" != "/usr/bin/python3" ]; then
+  MODEL="$APP/models/yolov8n.onnx"
+  check_model() {
+    "$PY" - "$1" <<'PYC'
+import sys, numpy as np, onnxruntime as ort
+s = ort.InferenceSession(sys.argv[1], providers=['CPUExecutionProvider'])
+i = s.get_inputs()[0]
+S = i.shape[2] if isinstance(i.shape[2], int) else 320
+o = s.run(None, {i.name: np.zeros((1, 3, S, S), np.float32)})[0]
+assert o.ndim == 3 and 84 in o.shape[1:], o.shape
+PYC
+  }
+  if [ -s "$MODEL" ] && check_model "$MODEL" </dev/null; then
+    echo "Model AI sudah ada dan valid."
+  else
+    rm -f "$MODEL"
+    for U in \
+      "https://huggingface.co/cabelo/yolov8/resolve/main/yolov8n.onnx" \
+      "https://huggingface.co/Quazim0t0/yolov8-onnx/resolve/main/yolov8n.onnx" \
+      "https://huggingface.co/Kalray/yolov8/resolve/main/yolov8n.onnx"; do
+      echo "Mengunduh model: $U"
+      if curl -fL --retry 2 -o "$MODEL.tmp" "$U" </dev/null && check_model "$MODEL.tmp" </dev/null; then
+        mv "$MODEL.tmp" "$MODEL"
+        echo "Model AI siap."
+        break
+      fi
+      rm -f "$MODEL.tmp"
+    done
+    [ -s "$MODEL" ] || echo "!! Model gagal diunduh/valid. AI nonaktif sampai file yolov8n.onnx ada di $MODEL"
+  fi
+fi
+
 echo "[4/5] Membuat service systemd..."
-cat > /etc/systemd/system/cctv-motion.service <<'SVCEOF'
+cat > /etc/systemd/system/cctv-motion.service <<SVCEOF
 [Unit]
 Description=Motion Guard - CCTV Motion Detection to Telegram
 After=network-online.target
@@ -620,7 +768,7 @@ Wants=network-online.target
 [Service]
 User=cctv
 WorkingDirectory=/opt/cctv-motion
-ExecStart=/usr/bin/python3 /opt/cctv-motion/app.py
+ExecStart=$PY /opt/cctv-motion/app.py
 Restart=always
 RestartSec=5
 Nice=5
